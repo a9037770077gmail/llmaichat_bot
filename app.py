@@ -2,11 +2,11 @@ import os
 import asyncio
 import threading
 import logging
-import aiohttp
 from flask import Flask
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import Command
+import httpx
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -24,12 +24,36 @@ if not OPENROUTER_API_KEY:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- Конфигурация OpenRouter ---
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Модель по умолчанию — можно заменить на любую другую из каталога OpenRouter
-DEFAULT_MODEL = "google/gemini-2.5-flash"  # или "openai/gpt-4o", "anthropic/claude-3.5-sonnet" и т.д.
-YOUR_SITE_URL = os.environ.get("SITE_URL", "https://t.me/ваш_канал")  # для статистики OpenRouter
-YOUR_APP_NAME = os.environ.get("APP_NAME", "Telegram AI Bot")
+# --- Функция для запроса к OpenRouter ---
+async def ask_openrouter(prompt: str) -> str:
+    """Отправляет запрос к OpenRouter и возвращает ответ."""
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        # Опционально: если хотите видеть свои запросы в логах OpenRouter
+        "HTTP-Referer": "https://t.me/your_bot_username",
+        "X-Title": "AI Chat Bot"
+    }
+    # Можно выбрать любую бесплатную модель из списка OpenRouter
+    # Например: "google/gemini-2.5-flash", "meta-llama/llama-3.3-70b-instruct", "mistralai/mistral-7b-instruct:free"
+    data = {
+        "model": "google/gemini-2.5-flash",  # или "meta-llama/llama-3.3-70b-instruct"
+        "messages": [
+            {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 2048,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, json=data, headers=headers)
+        if response.status_code != 200:
+            logging.error(f"OpenRouter API error: {response.status_code} - {response.text}")
+            raise Exception(f"API error {response.status_code}: {response.text}")
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
 
 # --- Обработчик команды /start ---
 @dp.message(Command("start"))
@@ -51,40 +75,13 @@ async def handle_message(message: Message):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:
-        # Формируем запрос к OpenRouter
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": YOUR_SITE_URL,  # Для статистики OpenRouter
-                "X-Title": YOUR_APP_NAME,       # Имя вашего приложения
-            }
-            payload = {
-                "model": DEFAULT_MODEL,
-                "messages": [
-                    {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."},
-                    {"role": "user", "content": user_text}
-                ],
-                "temperature": 0.7,
-                "max_tokens": 2048,
-            }
-
-            async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logging.error(f"OpenRouter ошибка {response.status}: {error_text}")
-                    await message.answer(f"⚠️ Ошибка API: {response.status}. Попробуйте позже.")
-                    return
-
-                data = await response.json()
-                answer = data.get("choices", [{}])[0].get("message", {}).get("content", "Извините, не удалось получить ответ.")
-                await message.answer(answer)
-
+        answer = await ask_openrouter(user_text)
+        await message.answer(answer)
     except Exception as e:
-        logging.error(f"Ошибка при обращении к OpenRouter: {e}")
-        await message.answer("⚠️ Произошла ошибка при обработке запроса. Попробуйте позже.")
+        logging.error(f"Ошибка: {e}")
+        await message.answer(f"⚠️ Ошибка API: {e}. Попробуйте позже.")
 
-# --- Flask-сервер для пингов (чтобы Render не усыплял бота) ---
+# --- Flask-сервер для пингов ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -96,17 +93,14 @@ def health():
     return "OK", 200
 
 def run_flask():
-    """Запускает Flask в отдельном потоке."""
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # --- Точка входа ---
 if __name__ == "__main__":
-    # Запускаем Flask в фоновом потоке
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Запускаем бота в ГЛАВНОМ потоке
-    logging.info("Запуск polling бота с OpenRouter...")
+    logging.info("Запуск polling бота...")
     asyncio.run(dp.start_polling(bot))
