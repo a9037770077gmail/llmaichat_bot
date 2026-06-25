@@ -6,7 +6,8 @@ from flask import Flask
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import Command
-import httpx
+from groq import Groq
+from openai import OpenAI  # для OpenRouter (совместим с OpenAI API)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -20,40 +21,23 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY не задан в переменных окружения")
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY не задан в переменных окружения")
+
+# --- Инициализация клиентов ---
+# OpenRouter (через OpenAI-совместимый клиент)
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
+
+# Groq
+groq_client = Groq(api_key=GROQ_API_KEY)
+
 # --- Инициализация бота ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-# --- Функция для запроса к OpenRouter ---
-async def ask_openrouter(prompt: str) -> str:
-    """Отправляет запрос к OpenRouter и возвращает ответ."""
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        # Опционально: если хотите видеть свои запросы в логах OpenRouter
-        "HTTP-Referer": "https://t.me/your_bot_username",
-        "X-Title": "AI Chat Bot"
-    }
-    # Можно выбрать любую бесплатную модель из списка OpenRouter
-    # Например: "google/gemini-2.5-flash", "meta-llama/llama-3.3-70b-instruct", "mistralai/mistral-7b-instruct:free"
-    data = {
-        "model": "google/gemini-2.5-flash",  # или "meta-llama/llama-3.3-70b-instruct"
-        "messages": [
-            {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 2048,
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, json=data, headers=headers)
-        if response.status_code != 200:
-            logging.error(f"OpenRouter API error: {response.status_code} - {response.text}")
-            raise Exception(f"API error {response.status_code}: {response.text}")
-        result = response.json()
-        return result["choices"][0]["message"]["content"]
 
 # --- Обработчик команды /start ---
 @dp.message(Command("start"))
@@ -71,36 +55,83 @@ async def handle_message(message: Message):
     if not user_text:
         return
 
-    # Показываем, что бот "печатает"
+    # Показываем "печатает..."
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:
-        answer = await ask_openrouter(user_text)
+        # Пытаемся через OpenRouter
+        completion = openrouter_client.chat.completions.create(
+            model="google/gemini-2.5-flash",  # можно сменить на другую модель
+            messages=[
+                {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."},
+                {"role": "user", "content": user_text}
+            ],
+            temperature=0.7,
+            max_tokens=2048,
+        )
+        answer = completion.choices[0].message.content
         await message.answer(answer)
+
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        await message.answer(f"⚠️ Ошибка API: {e}. Попробуйте позже.")
+        error_str = str(e)
+        logging.error(f"OpenRouter API error: {e}")
 
-# --- Flask-сервер для пингов ---
-app = Flask(__name__)
+        # Если ошибка 403 (лимит превышен) или "Key limit exceeded"
+        if "403" in error_str or "Key limit exceeded" in error_str:
+            # Переключаемся на Groq (fallback)
+            try:
+                await message.answer("🔄 Лимит OpenRouter исчерпан, переключаюсь на Groq...")
 
-@app.route('/')
+                completion = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."},
+                        {"role": "user", "content": user_text}
+                    ],
+                    temperature=0.7,
+                    max_tokens=2048,
+                )
+                answer = completion.choices[0].message.content
+                await message.answer(answer)
+
+            except Exception as groq_error:
+                logging.error(f"Groq fallback error: {groq_error}")
+                await message.answer(
+                    "⚠️ **Все API временно недоступны.**\n"
+                    "Пожалуйста, попробуйте позже."
+                )
+
+        else:
+            # Другие ошибки
+            await message.answer(
+                "⚠️ **Произошла ошибка при обращении к API.**\n"
+                "Попробуйте позже или сообщите администратору."
+            )
+
+# --- Flask-сервер для пингов (чтобы Render не усыплял бота) ---
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
 def home():
     return "Bot is running!"
 
-@app.route('/health')
+@flask_app.route('/health')
 def health():
     return "OK", 200
 
 def run_flask():
+    """Запускает Flask в отдельном потоке."""
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    # debug=False, use_reloader=False обязательны для работы в потоке
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # --- Точка входа ---
 if __name__ == "__main__":
+    # Запускаем Flask в фоновом потоке
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
+    # Запускаем бота в ГЛАВНОМ потоке (это важно для aiogram)
     logging.info("Запуск polling бота...")
     asyncio.run(dp.start_polling(bot))
