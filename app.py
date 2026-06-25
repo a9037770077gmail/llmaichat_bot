@@ -61,7 +61,7 @@ async def handle_message(message: Message):
     try:
         # Пытаемся через OpenRouter
         completion = openrouter_client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:free",  # можно сменить на другую модель
+            model="openrouter/free",  # можно сменить на другую модель
             messages=[
                 {"role": "system", "content": "Ты полезный AI-ассистент. Отвечай на русском языке кратко и по делу."},
                 {"role": "user", "content": user_text}
